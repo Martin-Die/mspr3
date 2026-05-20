@@ -124,7 +124,11 @@ def compute_metrics(
     mape = mean_absolute_percentage_error(y_true_arr, y_pred_arr) * 100  # en %
 
     logger.info(
-        f"[{label}] R²={r2:.4f} | RMSE={rmse:,.0f} MW | MAPE={mape:.2f}%"
+        "[Évaluation] %s : R²=%.4f, RMSE=%s MW, MAPE=%.2f %%",
+        label,
+        r2,
+        f"{rmse:,.0f}",
+        mape,
     )
     return {"r2": r2, "rmse": rmse, "mape": mape}
 
@@ -142,21 +146,28 @@ def benchmark_rte(y_true: pd.Series, y_prevision_j1: pd.Series) -> dict:
 
 def train_model(name: str, pipeline: Pipeline, x_train, y_train) -> tuple[Pipeline, float]:
     """Entraîne un pipeline et retourne (pipeline_entraîné, durée_sec)."""
-    logger.info(f"Entraînement : {name} …")
+    logger.info("[Entraînement] Modèle en cours : %s", name)
     t0 = time.perf_counter()
     pipeline.fit(x_train, y_train)
     elapsed = time.perf_counter() - t0
-    logger.info(f"  → {elapsed:.2f}s")
+    logger.info("[Entraînement] Modèle %s terminé en %.2f s", name, elapsed)
     return pipeline, elapsed
 
 
 def train_all(x_train, y_train) -> dict:
     """Entraîne les 4 modèles et retourne un dict nom → (pipeline, durée)."""
     models = build_models()
+    logger.info(
+        "[Entraînement] Début : %d modèle(s), %d échantillon(s)",
+        len(models),
+        len(x_train),
+    )
     trained = {}
-    for name, pipe in models.items():
+    for i, (name, pipe) in enumerate(models.items(), start=1):
+        logger.info("[Entraînement] Progression : %d/%d", i, len(models))
         pipe, elapsed = train_model(name, pipe, x_train, y_train)
         trained[name] = {"pipeline": pipe, "train_time": elapsed}
+    logger.info("[Entraînement] Tous les modèles ont été entraînés")
     return trained
 
 
@@ -169,8 +180,15 @@ def evaluate_all(trained: dict, x_val, y_val, x_test, y_test) -> pd.DataFrame:
     Évalue chaque modèle sur val + test.
     Retourne un DataFrame de comparaison trié par R² test décroissant.
     """
+    logger.info(
+        "[Évaluation] Début : %d modèle(s), validation=%d, test=%d échantillon(s)",
+        len(trained),
+        len(x_val),
+        len(x_test),
+    )
     rows = []
-    for name, info in trained.items():
+    for i, (name, info) in enumerate(trained.items(), start=1):
+        logger.info("[Évaluation] Modèle %d/%d : %s", i, len(trained), name)
         pipe = info["pipeline"]
 
         y_pred_val  = pipe.predict(x_val)
@@ -191,6 +209,12 @@ def evaluate_all(trained: dict, x_val, y_val, x_test, y_test) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows).sort_values("r2_test", ascending=False).reset_index(drop=True)
+    best = df.iloc[0]
+    logger.info(
+        "[Évaluation] Terminée. Meilleur modèle : %s (R² test=%.4f)",
+        best["model"],
+        best["r2_test"],
+    )
     return df
 
 
@@ -220,16 +244,19 @@ def select_best_model(results: pd.DataFrame, benchmark: dict) -> str | None:
     wins = sum([beats_mape, beats_r2, beats_rmse])
     model_name = best["model"]
 
+    logger.info("[Sélection] Comparaison au benchmark RTE J-1")
     if wins >= 2:
         logger.info(
-            f"Modèle retenu : {model_name} | "
-            f"R²={best['r2_test']:.4f} MAPE={best['mape_test']:.2f}% "
-            f"(bat le benchmark sur {wins}/3 métriques)"
+            "[Sélection] Modèle retenu : %s (R²=%.4f, MAPE=%.2f %%, bat le benchmark sur %d/3 métriques)",
+            model_name,
+            best["r2_test"],
+            best["mape_test"],
+            wins,
         )
         return model_name
     else:
         logger.warning(
-            "Aucun modèle ne bat le benchmark sur 2+ métriques. "
+            "[Sélection] Aucun modèle ne bat le benchmark sur au moins 2 métriques. "
             "Baseline RTE J-1 recommandée."
         )
         return None
@@ -273,16 +300,17 @@ def save_model_if_better(
         old_metrics = json.loads(meta_path.read_text(encoding="utf-8"))
         if not _is_better_than_saved(test_metrics, old_metrics):
             logger.info(
-                "Modèle %s conservé — R² test actuel %.4f ≥ nouveau %.4f.",
+                "[Sauvegarde] Modèle %s conservé (R² test actuel %.4f >= nouveau %.4f)",
                 name,
                 old_metrics["r2_test"],
                 test_metrics["r2_test"],
             )
             return None
 
+    logger.info("[Sauvegarde] Enregistrement du modèle %s", name)
     joblib.dump(pipeline, model_path)
     meta_path.write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
-    logger.info("Modèle sauvegardé : %s", model_path)
+    logger.info("[Sauvegarde] Modèle enregistré : %s", model_path)
     return model_path
 
 
@@ -290,7 +318,7 @@ def save_model(pipeline: Pipeline, name: str, version: str = "latest") -> Path:
     """Sérialise le pipeline (écrase l'existant)."""
     model_path, _ = _model_paths(name, version)
     joblib.dump(pipeline, model_path)
-    logger.info("Modèle sauvegardé : %s", model_path)
+    logger.info("[Sauvegarde] Modèle enregistré : %s", model_path)
     return model_path
 
 
@@ -299,8 +327,9 @@ def load_model(name: str, version: str = "latest") -> Pipeline:
     path, _ = _model_paths(name, version)
     if not path.exists():
         raise FileNotFoundError(f"Modèle introuvable : {path}")
+    logger.info("[Chargement] Lecture du modèle %s", name)
     pipeline = joblib.load(path)
-    logger.info(f"Modèle chargé : {path}")
+    logger.info("[Chargement] Modèle chargé depuis %s", path)
     return pipeline
 
 
@@ -319,12 +348,16 @@ if __name__ == "__main__":
         logger.error("Usage : python models.py <fichier_2023.xls> <fichier_2024.xls>")
         sys.exit(1)
 
+    logger.info("[Pipeline] Étape 1/4 : préparation des données (ETL)")
     x_train, x_val, x_test, y_train, y_val, y_test, feats = run_pipeline(data_paths)
+    logger.info("[Pipeline] Données prêtes : %d variable(s)", len(feats))
 
+    logger.info("[Pipeline] Étape 2/4 : entraînement des modèles")
     trained = train_all(x_train, y_train)
+
+    logger.info("[Pipeline] Étape 3/4 : évaluation et comparaison")
     results = evaluate_all(trained, x_val, y_val, x_test, y_test)
-    print("\n=== Tableau comparatif des modèles ===")
-    print(results.to_string(index=False))
+    logger.info("[Pipeline] Résultats :\n%s", results.to_string(index=False))
 
     best_row = results.iloc[0]
     best_name = str(best_row["model"])
@@ -333,4 +366,6 @@ if __name__ == "__main__":
         "rmse_test": float(best_row["rmse_test"]),
         "mape_test": float(best_row["mape_test"]),
     }
+    logger.info("[Pipeline] Étape 4/4 : sauvegarde du meilleur modèle (%s)", best_name)
     save_model_if_better(trained[best_name]["pipeline"], best_name, test_metrics)
+    logger.info("[Pipeline] Exécution terminée")

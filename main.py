@@ -20,6 +20,8 @@ from typing import Optional
 
 import joblib
 import numpy as np
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -63,18 +65,28 @@ def get_model(name: str):
         path = MODELS_DIR / f"{name}.joblib"
         if not path.exists():
             raise FileNotFoundError(f"Modèle {name} introuvable dans {MODELS_DIR}")
+        logger.info("[API] Chargement du modèle : %s", name)
         _model_cache[name] = {
             "pipeline": joblib.load(path),
             "loaded_at": datetime.now(UTC).isoformat(),
             "path": str(path),
         }
-        logger.info(f"Modèle chargé : {name}")
+        logger.info("[API] Modèle %s chargé et mis en cache", name)
     return _model_cache[name]["pipeline"]
 
 
 # --------------------------------------------------------------------------- #
 # App                                                                          #
 # --------------------------------------------------------------------------- #
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("[API] Application démarrée (version %s)", APP_VERSION)
+    logger.info("[API] Modèle par défaut : %s", DEFAULT_MODEL)
+    logger.info("[API] Répertoire des modèles : %s", MODELS_DIR.resolve())
+    yield
+    logger.info("[API] Arrêt de l'application")
+
 
 app = FastAPI(
     title="EDF — API de prédiction de la consommation électrique",
@@ -85,6 +97,7 @@ app = FastAPI(
     version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -179,6 +192,11 @@ async def rate_limit_middleware(request: Request, call_next):
         _request_counts[ip] = (1, now)
     else:
         if count >= RATE_LIMIT:
+            logger.warning(
+                "[API] Limite de débit atteinte pour %s (%d requêtes/min)",
+                ip,
+                RATE_LIMIT,
+            )
             from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=429,
@@ -257,13 +275,16 @@ def _build_feature_vector(req: PredictRequest) -> np.ndarray:
 @app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
 def health():
     """Vérification de l'état du service (healthcheck)."""
+    logger.info("[API] Requête GET /health")
     try:
         get_model(DEFAULT_MODEL)
         loaded = True
         loaded_at = _model_cache[DEFAULT_MODEL]["loaded_at"]
-    except Exception:
+        logger.info("[API] Santé : opérationnel (modèle %s chargé)", DEFAULT_MODEL)
+    except Exception as exc:
         loaded = False
         loaded_at = None
+        logger.warning("[API] Santé dégradée : %s", exc)
 
     return HealthResponse(
         status="ok" if loaded else "degraded",
@@ -301,14 +322,22 @@ def predict(req: PredictRequest):
     """
     t0 = time.perf_counter()
     _cnt.requests_total += 1
+    logger.info(
+        "[API] Requête POST /predict : date=%s, modèle=%s",
+        req.date,
+        req.model_name,
+    )
 
     try:
         pipeline = get_model(req.model_name)
     except FileNotFoundError as exc:
         _cnt.predict_errors += 1
+        logger.error("[API] Prédiction échouée : modèle introuvable (%s)", req.model_name)
         raise HTTPException(status_code=404, detail=str(exc))
 
+    logger.info("[API] Construction du vecteur de features")
     X = _build_feature_vector(req)
+    logger.info("[API] Inférence en cours")
     prediction = float(pipeline.predict(X)[0])
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
@@ -316,8 +345,9 @@ def predict(req: PredictRequest):
     _cnt.latencies.append(latency_ms)
 
     logger.info(
-        f"predict | date={req.date} model={req.model_name} "
-        f"pred={prediction:.0f}MW latency={latency_ms}ms"
+        "[API] Prédiction terminée : %.0f MW, latence=%.2f ms",
+        prediction,
+        latency_ms,
     )
 
     return PredictResponse(
@@ -334,7 +364,9 @@ def predict(req: PredictRequest):
 @app.get("/models", tags=["Monitoring"])
 def list_models():
     """Liste les modèles disponibles dans le répertoire MODELS_DIR."""
+    logger.info("[API] Requête GET /models")
     paths = list(MODELS_DIR.glob("*.joblib"))
+    logger.info("[API] %d modèle(s) disponible(s) dans %s", len(paths), MODELS_DIR)
     return {
         "available_models": [p.stem for p in paths],
         "loaded_in_cache": list(_model_cache.keys()),
@@ -348,6 +380,7 @@ def metrics_prometheus():
     Exposition des métriques au format Prometheus (text/plain).
     Destiné au scraping par prometheus.yml.
     """
+    logger.info("[API] Requête GET /metrics")
     latencies = _cnt.latencies or [0]
     p50 = float(np.percentile(latencies, 50))
     p95 = float(np.percentile(latencies, 95))
