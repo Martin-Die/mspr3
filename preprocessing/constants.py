@@ -35,8 +35,7 @@ JOURS_FERIES_FR = {
 }
 
 FEATURE_COLS = [
-    "prevision_j1", "nucleaire", "eolien", "solaire", "hydraulique", "gaz", "co2",
-    "consommation_max", "consommation_min",
+    "prevision_j1",
     "day_of_week", "month", "day_of_year", "is_weekend", "is_holiday", "saison",
     "month_sin", "month_cos", "dow_sin", "dow_cos",
     "lag_1", "lag_7", "prevision_j1_lag1",

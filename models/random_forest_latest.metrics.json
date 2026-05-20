@@ -1,5 +1,5 @@
 {
-  "r2_test": 0.9909,
-  "rmse_test": 762.0,
-  "mape_test": 1.0
+  "r2_test": 0.9843,
+  "rmse_test": 988.0,
+  "mape_test": 1.33
 }
