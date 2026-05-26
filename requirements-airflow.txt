@@ -1,0 +1,5 @@
+-r requirements.txt
+snowflake-connector-python>=3.6.0
+pyarrow>=14.0.0
+pytest>=7.4.0
+httpx>=0.25.0

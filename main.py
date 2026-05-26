@@ -42,14 +42,7 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "random_forest_latest")
 APP_VERSION  = "1.0.0"
 RATE_LIMIT   = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
 
-# Colonnes attendues par le modèle (dans l'ordre du feature engineering)
-FEATURE_COLS = [
-    "prevision_j1", "nucleaire", "eolien", "solaire", "hydraulique", "gaz", "co2",
-    "consommation_max", "consommation_min",
-    "day_of_week", "month", "day_of_year", "is_weekend", "is_holiday", "saison",
-    "month_sin", "month_cos", "dow_sin", "dow_cos",
-    "lag_1", "lag_7", "prevision_j1_lag1",
-]
+from preprocessing.constants import FEATURE_COLS, JOURS_FERIES_FR
 
 # --------------------------------------------------------------------------- #
 # Cache modèles                                                                #
@@ -124,27 +117,13 @@ _cnt = _Counters()
 # Schémas Pydantic                                                             #
 # --------------------------------------------------------------------------- #
 
-JOURS_FERIES_FR = {
-    "2023-01-01","2023-04-10","2023-05-01","2023-05-08","2023-05-18",
-    "2023-05-29","2023-07-14","2023-08-15","2023-11-01","2023-11-11","2023-12-25",
-    "2024-01-01","2024-04-01","2024-05-01","2024-05-08","2024-05-09",
-    "2024-05-20","2024-07-14","2024-08-15","2024-11-01","2024-11-11","2024-12-25",
-}
-
-
 class PredictRequest(BaseModel):
-    """Corps de la requête POST /predict."""
+    """Corps de la requête POST /predict (aligné sur le modèle entraîné par Airflow)."""
     date: DateType = Field(..., description="Date cible (YYYY-MM-DD)")
     prevision_j1: Optional[float] = Field(None, description="Prévision RTE J-1 en MW (optionnel)")
-    nucleaire:    Optional[float] = Field(None, description="Production nucléaire estimée en MW")
-    eolien:       Optional[float] = Field(None, description="Production éolienne estimée en MW")
-    solaire:      Optional[float] = Field(None, description="Production solaire estimée en MW")
-    hydraulique:  Optional[float] = Field(None, description="Production hydraulique estimée en MW")
-    gaz:          Optional[float] = Field(None, description="Production gaz estimée en MW")
-    co2:          Optional[float] = Field(None, description="Taux CO2 estimé en g/kWh")
-    lag_1:        Optional[float] = Field(None, description="Consommation J-1 réelle en MW")
-    lag_7:        Optional[float] = Field(None, description="Consommation J-7 réelle en MW")
-    model_name:   str             = Field(DEFAULT_MODEL, description="Nom du modèle à utiliser")
+    lag_1: Optional[float] = Field(None, description="Consommation J-1 réelle en MW")
+    lag_7: Optional[float] = Field(None, description="Consommation J-7 réelle en MW")
+    model_name: str = Field(DEFAULT_MODEL, description="Nom du modèle à utiliser")
 
     @field_validator("date")
     @classmethod
@@ -218,51 +197,33 @@ def _saison(month: int) -> int:
     return 3
 
 
+def _num(value: Optional[float], default: float) -> float:
+    """None -> défaut ; 0 est une valeur valide (ne pas confondre avec absent)."""
+    return default if value is None else float(value)
+
+
 def _build_feature_vector(req: PredictRequest) -> np.ndarray:
-    """Construit le vecteur de features à partir de la requête."""
+    """Construit le vecteur de features (même ordre que l'entraînement Airflow)."""
     d = req.date
     is_holiday = int(d.strftime("%Y-%m-%d") in JOURS_FERIES_FR)
-    is_weekend  = int(d.weekday() >= 5)
+    is_weekend = int(d.weekday() >= 5)
 
-    # Valeurs par défaut issues des moyennes historiques (France 2023-2024)
-    defaults = {
-        "prevision_j1": 50_000,
-        "nucleaire":     36_000,
-        "eolien":         8_000,
-        "solaire":        3_000,
-        "hydraulique":    8_500,
-        "gaz":            5_500,
-        "co2":               60,
-        "consommation_max": 58_000,
-        "consommation_min": 42_000,
-        "lag_1": 50_000,
-        "lag_7": 50_000,
-        "prevision_j1_lag1": 50_000,
-    }
-
+    prevision = _num(req.prevision_j1, 50_000)
     vals = {
-        "prevision_j1":      req.prevision_j1 or defaults["prevision_j1"],
-        "nucleaire":         req.nucleaire    or defaults["nucleaire"],
-        "eolien":            req.eolien       or defaults["eolien"],
-        "solaire":           req.solaire      or defaults["solaire"],
-        "hydraulique":       req.hydraulique  or defaults["hydraulique"],
-        "gaz":               req.gaz          or defaults["gaz"],
-        "co2":               req.co2          or defaults["co2"],
-        "consommation_max":  defaults["consommation_max"],
-        "consommation_min":  defaults["consommation_min"],
-        "day_of_week":       d.weekday(),
-        "month":             d.month,
-        "day_of_year":       d.timetuple().tm_yday,
-        "is_weekend":        is_weekend,
-        "is_holiday":        is_holiday,
-        "saison":            _saison(d.month),
-        "month_sin":         np.sin(2 * np.pi * d.month / 12),
-        "month_cos":         np.cos(2 * np.pi * d.month / 12),
-        "dow_sin":           np.sin(2 * np.pi * d.weekday() / 7),
-        "dow_cos":           np.cos(2 * np.pi * d.weekday() / 7),
-        "lag_1":             req.lag_1 or defaults["lag_1"],
-        "lag_7":             req.lag_7 or defaults["lag_7"],
-        "prevision_j1_lag1": (req.prevision_j1 or defaults["prevision_j1_lag1"]),
+        "prevision_j1": prevision,
+        "day_of_week": d.weekday(),
+        "month": d.month,
+        "day_of_year": d.timetuple().tm_yday,
+        "is_weekend": is_weekend,
+        "is_holiday": is_holiday,
+        "saison": _saison(d.month),
+        "month_sin": np.sin(2 * np.pi * d.month / 12),
+        "month_cos": np.cos(2 * np.pi * d.month / 12),
+        "dow_sin": np.sin(2 * np.pi * d.weekday() / 7),
+        "dow_cos": np.cos(2 * np.pi * d.weekday() / 7),
+        "lag_1": _num(req.lag_1, 50_000),
+        "lag_7": _num(req.lag_7, 50_000),
+        "prevision_j1_lag1": prevision,
     }
 
     return np.array([[vals[c] for c in FEATURE_COLS]])
