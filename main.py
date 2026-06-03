@@ -3,10 +3,11 @@ API REST FastAPI — Prédiction de la consommation électrique EDF.
 MSPR Bloc 3 | Arthur Méry, Martin Dié, Imed Eddine Zeroual
 
 Endpoints :
-  POST /predict   → prédiction de consommation journalière
-  GET  /health    → état de santé du service
-  GET  /metrics   → métriques Prometheus (scraping)
-  GET  /models    → liste des modèles disponibles
+  POST /predict      → prédiction de consommation journalière
+  GET  /health       → état de santé du service
+  GET  /metrics      → métriques Prometheus (scraping)
+  GET  /models       → liste des modèles disponibles
+  GET  /models/info  → détails du modèle actif (métriques, hyperparamètres, date)
 """
 
 from __future__ import annotations
@@ -18,13 +19,15 @@ from datetime import UTC, date as DateType, datetime
 from pathlib import Path
 from typing import Optional
 
+import json
 import joblib
 import numpy as np
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
 # --------------------------------------------------------------------------- #
@@ -37,10 +40,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODELS_DIR   = Path(os.getenv("MODELS_DIR", "models"))
+MODELS_DIR    = Path(os.getenv("MODELS_DIR", "models"))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "random_forest_latest")
-APP_VERSION  = "1.0.0"
-RATE_LIMIT   = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
+APP_VERSION   = "1.0.0"
+RATE_LIMIT    = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
+# Si API_KEY est défini dans l'environnement, l'authentification est activée.
+_API_KEY      = os.getenv("API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 from preprocessing.constants import FEATURE_COLS, JOURS_FERIES_FR
 
@@ -66,6 +72,24 @@ def get_model(name: str):
         }
         logger.info("[API] Modèle %s chargé et mis en cache", name)
     return _model_cache[name]["pipeline"]
+
+
+def _load_metrics(name: str) -> dict:
+    """Charge le fichier .metrics.json associé à un modèle, si présent."""
+    path = MODELS_DIR / f"{name}.metrics.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _check_api_key(key: str | None) -> None:
+    """Lève 401 si l'authentification par clé API est activée et que la clé est invalide."""
+    if _API_KEY and key != _API_KEY:
+        logger.warning("[API] Tentative d'accès avec une clé invalide")
+        raise HTTPException(status_code=401, detail="Clé API manquante ou invalide.")
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +163,7 @@ class PredictResponse(BaseModel):
     model_name:          str
     model_version:       str
     r2_score:            Optional[float] = None
+    rmse_mw:             Optional[float] = None
     mape_percent:        Optional[float] = None
     prevision_rte_j1_mw: Optional[float] = None
     latency_ms:          float
@@ -274,13 +299,14 @@ def health():
         },
     },
 )
-def predict(req: PredictRequest):
+def predict(req: PredictRequest, api_key: str | None = Security(_api_key_header)):
     """
     Prédit la consommation électrique journalière nationale (en MW).
 
     Les champs production (nucléaire, éolien, solaire…) sont optionnels :
     des valeurs moyennes historiques sont utilisées si non fournis.
     """
+    _check_api_key(api_key)
     t0 = time.perf_counter()
     _cnt.requests_total += 1
     logger.info(
@@ -305,10 +331,13 @@ def predict(req: PredictRequest):
     _cnt.predict_ok += 1
     _cnt.latencies.append(latency_ms)
 
+    metrics = _load_metrics(req.model_name)
     logger.info(
-        "[API] Prédiction terminée : %.0f MW, latence=%.2f ms",
+        "[API] Prédiction terminée : %.0f MW, latence=%.2f ms, modèle=%s, version=%s",
         prediction,
         latency_ms,
+        req.model_name,
+        APP_VERSION,
     )
 
     return PredictResponse(
@@ -316,6 +345,9 @@ def predict(req: PredictRequest):
         prediction_mw=round(prediction, 1),
         model_name=req.model_name,
         model_version=APP_VERSION,
+        r2_score=metrics.get("r2_test"),
+        rmse_mw=metrics.get("rmse_test"),
+        mape_percent=metrics.get("mape_test"),
         prevision_rte_j1_mw=req.prevision_j1,
         latency_ms=latency_ms,
         timestamp=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -332,6 +364,44 @@ def list_models():
         "available_models": [p.stem for p in paths],
         "loaded_in_cache": list(_model_cache.keys()),
         "default_model": DEFAULT_MODEL,
+    }
+
+
+@app.get("/models/info", tags=["Monitoring"])
+def models_info(model_name: str = DEFAULT_MODEL):
+    """
+    Détails du modèle actif : métriques d'entraînement, hyperparamètres, date de chargement.
+
+    Paramètre optionnel `model_name` pour interroger un modèle spécifique.
+    """
+    logger.info("[API] Requête GET /models/info (modèle=%s)", model_name)
+    try:
+        pipeline = get_model(model_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    metrics = _load_metrics(model_name)
+    cache_entry = _model_cache.get(model_name, {})
+
+    # Extraction des hyperparamètres du dernier estimateur du pipeline
+    try:
+        estimator = pipeline.steps[-1][1]
+        hyperparams = estimator.get_params()
+    except Exception:
+        hyperparams = {}
+
+    return {
+        "model_name": model_name,
+        "default_model": DEFAULT_MODEL,
+        "loaded_at": cache_entry.get("loaded_at"),
+        "metrics": {
+            "r2_test":    metrics.get("r2_test"),
+            "rmse_test":  metrics.get("rmse_test"),
+            "mape_test":  metrics.get("mape_test"),
+        },
+        "hyperparameters": hyperparams,
+        "model_type": type(pipeline.steps[-1][1]).__name__,
+        "api_version": APP_VERSION,
     }
 
 
