@@ -9,7 +9,7 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - RELOAD=false
-    restart: unless-stopped
+    restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
