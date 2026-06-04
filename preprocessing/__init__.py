@@ -19,7 +19,7 @@ from preprocessing.constants import (
 from preprocessing.extract import extract, load_rte_file
 from preprocessing.load import load
 from preprocessing.pipeline import run_etl, run_pipeline
-from preprocessing.transform import transform
+from preprocessing.transform import aggregate_daily, clean, engineer_features, transform
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -30,6 +30,9 @@ __all__ = [
     "NUMERIC_FEATURES",
     "FEATURE_COLS",
     "extract",
+    "clean",
+    "aggregate_daily",
+    "engineer_features",
     "transform",
     "load",
     "load_rte_file",

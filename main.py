@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
+from preprocessing.constants import FEATURE_COLS, JOURS_FERIES_FR
+
 # --------------------------------------------------------------------------- #
 # Config                                                                       #
 # --------------------------------------------------------------------------- #
@@ -37,17 +39,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODELS_DIR   = Path(os.getenv("MODELS_DIR", "models"))
+MODELS_DIR    = Path(os.getenv("MODELS_DIR", "models"))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "random_forest_latest")
-APP_VERSION  = "1.0.0"
-RATE_LIMIT   = int(os.getenv("RATE_LIMIT_PER_MIN", "10000"))
-# Colonnes attendues par le modèle (dans l'ordre du feature engineering)
-FEATURE_COLS = [
-    "prevision_j1",
-    "day_of_week", "month", "day_of_year", "is_weekend", "is_holiday", "saison",
-    "month_sin", "month_cos", "dow_sin", "dow_cos",
-    "lag_1", "lag_7", "prevision_j1_lag1",
-]
+APP_VERSION   = "1.0.0"
+RATE_LIMIT    = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
 
 # --------------------------------------------------------------------------- #
 # Cache modèles                                                                #
@@ -122,27 +117,13 @@ _cnt = _Counters()
 # Schémas Pydantic                                                             #
 # --------------------------------------------------------------------------- #
 
-JOURS_FERIES_FR = {
-    "2023-01-01","2023-04-10","2023-05-01","2023-05-08","2023-05-18",
-    "2023-05-29","2023-07-14","2023-08-15","2023-11-01","2023-11-11","2023-12-25",
-    "2024-01-01","2024-04-01","2024-05-01","2024-05-08","2024-05-09",
-    "2024-05-20","2024-07-14","2024-08-15","2024-11-01","2024-11-11","2024-12-25",
-}
-
-
 class PredictRequest(BaseModel):
     """Corps de la requête POST /predict."""
     date: DateType = Field(..., description="Date cible (YYYY-MM-DD)")
     prevision_j1: Optional[float] = Field(None, description="Prévision RTE J-1 en MW (optionnel)")
-    nucleaire:    Optional[float] = Field(None, description="Production nucléaire estimée en MW")
-    eolien:       Optional[float] = Field(None, description="Production éolienne estimée en MW")
-    solaire:      Optional[float] = Field(None, description="Production solaire estimée en MW")
-    hydraulique:  Optional[float] = Field(None, description="Production hydraulique estimée en MW")
-    gaz:          Optional[float] = Field(None, description="Production gaz estimée en MW")
-    co2:          Optional[float] = Field(None, description="Taux CO2 estimé en g/kWh")
-    lag_1:        Optional[float] = Field(None, description="Consommation J-1 réelle en MW")
-    lag_7:        Optional[float] = Field(None, description="Consommation J-7 réelle en MW")
-    model_name:   str             = Field(DEFAULT_MODEL, description="Nom du modèle à utiliser")
+    lag_1: Optional[float] = Field(None, description="Consommation J-1 réelle en MW")
+    lag_7: Optional[float] = Field(None, description="Consommation J-7 réelle en MW")
+    model_name: str = Field(DEFAULT_MODEL, description="Nom du modèle à utiliser")
 
     @field_validator("date")
     @classmethod
@@ -216,21 +197,20 @@ def _saison(month: int) -> int:
     return 3
 
 
+def _num(value: Optional[float], default: float) -> float:
+    """None -> défaut ; 0 est une valeur valide."""
+    return default if value is None else float(value)
+
+
 def _build_feature_vector(req: PredictRequest) -> np.ndarray:
-    """Construit le vecteur de features à partir de la requête."""
+    """Construit le vecteur de features (même ordre que l'entraînement)."""
     d = req.date
     is_holiday = int(d.strftime("%Y-%m-%d") in JOURS_FERIES_FR)
     is_weekend = int(d.weekday() >= 5)
 
-    defaults = {
-        "prevision_j1": 50_000,
-        "lag_1": 50_000,
-        "lag_7": 50_000,
-        "prevision_j1_lag1": 50_000,
-    }
-
+    prevision = _num(req.prevision_j1, 50_000)
     vals = {
-        "prevision_j1":      req.prevision_j1 or defaults["prevision_j1"],
+        "prevision_j1":      prevision,
         "day_of_week":       d.weekday(),
         "month":             d.month,
         "day_of_year":       d.timetuple().tm_yday,
@@ -241,9 +221,9 @@ def _build_feature_vector(req: PredictRequest) -> np.ndarray:
         "month_cos":         np.cos(2 * np.pi * d.month / 12),
         "dow_sin":           np.sin(2 * np.pi * d.weekday() / 7),
         "dow_cos":           np.cos(2 * np.pi * d.weekday() / 7),
-        "lag_1":             req.lag_1 or defaults["lag_1"],
-        "lag_7":             req.lag_7 or defaults["lag_7"],
-        "prevision_j1_lag1": (req.prevision_j1 or defaults["prevision_j1_lag1"]),
+        "lag_1":             _num(req.lag_1, 50_000),
+        "lag_7":             _num(req.lag_7, 50_000),
+        "prevision_j1_lag1": prevision,
     }
 
     return np.array([[vals[c] for c in FEATURE_COLS]])
@@ -261,7 +241,6 @@ def health():
         get_model(DEFAULT_MODEL)
         loaded = True
         loaded_at = _model_cache[DEFAULT_MODEL]["loaded_at"]
-        logger.info("[API] Santé : opérationnel (modèle %s chargé)", DEFAULT_MODEL)
     except Exception as exc:
         loaded = False
         loaded_at = None
@@ -277,59 +256,27 @@ def health():
     )
 
 
-@app.post(
-    "/predict",
-    response_model=PredictResponse,
-    tags=["Prédiction"],
-    responses={
-        404: {
-            "description": "Modèle demandé introuvable dans MODELS_DIR",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "Modèle random_forest_latest introuvable dans models",
-                    }
-                }
-            },
-        },
-    },
-)
+@app.post("/predict", response_model=PredictResponse, tags=["Prédiction"])
 def predict(req: PredictRequest):
-    """
-    Prédit la consommation électrique journalière nationale (en MW).
-
-    Les champs production (nucléaire, éolien, solaire…) sont optionnels :
-    des valeurs moyennes historiques sont utilisées si non fournis.
-    """
+    """Prédit la consommation électrique journalière nationale (en MW)."""
     t0 = time.perf_counter()
     _cnt.requests_total += 1
-    logger.info(
-        "[API] Requête POST /predict : date=%s, modèle=%s",
-        req.date,
-        req.model_name,
-    )
+    logger.info("[API] Requête POST /predict : date=%s, modèle=%s", req.date, req.model_name)
 
     try:
         pipeline = get_model(req.model_name)
     except FileNotFoundError as exc:
         _cnt.predict_errors += 1
-        logger.error("[API] Prédiction échouée : modèle introuvable (%s)", req.model_name)
         raise HTTPException(status_code=404, detail=str(exc))
 
-    logger.info("[API] Construction du vecteur de features")
     X = _build_feature_vector(req)
-    logger.info("[API] Inférence en cours")
     prediction = float(pipeline.predict(X)[0])
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
     _cnt.predict_ok += 1
     _cnt.latencies.append(latency_ms)
 
-    logger.info(
-        "[API] Prédiction terminée : %.0f MW, latence=%.2f ms",
-        prediction,
-        latency_ms,
-    )
+    logger.info("[API] Prédiction : %.0f MW, latence=%.2f ms", prediction, latency_ms)
 
     return PredictResponse(
         date=str(req.date),
@@ -344,10 +291,8 @@ def predict(req: PredictRequest):
 
 @app.get("/models", tags=["Monitoring"])
 def list_models():
-    """Liste les modèles disponibles dans le répertoire MODELS_DIR."""
-    logger.info("[API] Requête GET /models")
+    """Liste les modèles disponibles dans MODELS_DIR."""
     paths = list(MODELS_DIR.glob("*.joblib"))
-    logger.info("[API] %d modèle(s) disponible(s) dans %s", len(paths), MODELS_DIR)
     return {
         "available_models": [p.stem for p in paths],
         "loaded_in_cache": list(_model_cache.keys()),
@@ -357,11 +302,7 @@ def list_models():
 
 @app.get("/metrics", response_class=PlainTextResponse, tags=["Monitoring"])
 def metrics_prometheus():
-    """
-    Exposition des métriques au format Prometheus (text/plain).
-    Destiné au scraping par prometheus.yml.
-    """
-    logger.info("[API] Requête GET /metrics")
+    """Métriques au format Prometheus."""
     latencies = _cnt.latencies or [0]
     p50 = float(np.percentile(latencies, 50))
     p95 = float(np.percentile(latencies, 95))
@@ -397,5 +338,4 @@ def metrics_prometheus():
 
 if __name__ == "__main__":
     from run_server import run
-
     run()

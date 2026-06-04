@@ -124,11 +124,24 @@ def _add_features(daily: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean(raw: pd.DataFrame) -> pd.DataFrame:
+    """Nettoyage et préparation des données brutes."""
+    return _clean(raw)
+
+
+def aggregate_daily(cleaned: pd.DataFrame) -> pd.DataFrame:
+    """Agrégation journalière."""
+    return _aggregate_daily(cleaned)
+
+
+def engineer_features(daily: pd.DataFrame) -> pd.DataFrame:
+    """Feature engineering sur série journalière."""
+    return _add_features(daily)
+
+
 def transform(raw: pd.DataFrame) -> pd.DataFrame:
     """Enchaîne nettoyage → agrégation → feature engineering."""
     logger.info("[ETL - Transform] Début de la transformation (%s lignes en entrée)", f"{len(raw):,}")
-    cleaned = _clean(raw)
-    daily = _aggregate_daily(cleaned)
-    featured = _add_features(daily)
+    featured = engineer_features(aggregate_daily(clean(raw)))
     logger.info("[ETL - Transform] Transformation terminée")
     return featured

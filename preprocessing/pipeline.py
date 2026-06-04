@@ -1,5 +1,6 @@
 """
 Orchestration ETL : Extract → Transform → Load.
+L'orchestration planifiée (pipeline complète ML) est gérée par Airflow (dags/edf_consumption_pipeline.py).
 """
 
 import logging
