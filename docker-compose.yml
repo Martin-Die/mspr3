@@ -1,37 +1,115 @@
-version: "3.8"
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDF MSPR Bloc 3 — Stack complète
+#   mlflow    → Tracking server + Model Registry (port 5000)
+#   api       → FastAPI / uvicorn            (port 8000)
+#   prometheus → Scraping métriques          (port 9090)
+#   grafana   → Dashboard                   (port 3000)
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  edf-net:
+    driver: bridge
+
+volumes:
+  mlflow-db:
+  mlflow-artifacts:
+  prometheus-data:
+  grafana-data:
 
 services:
+
+  # ── MLflow tracking server ─────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.2
+    container_name: edf-mlflow
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-db:/mlflow/db               # backend SQLite
+      - mlflow-artifacts:/mlflow/artifacts  # artefacts (joblib, metrics…)
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:////mlflow/db/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - edf-net
+
+  # ── API FastAPI ────────────────────────────────────────────────────────────
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: edf-api
+    restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./models:/app/models                # joblib + metrics.json
+      - mlflow-artifacts:/mlflow/artifacts  # accès lecture aux artefacts
     environment:
+      - MODELS_DIR=/app/models
+      - DEFAULT_MODEL=random_forest_latest
+      - RATE_LIMIT_PER_MIN=100
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_EXPERIMENT=edf-consumption
       - HOST=0.0.0.0
       - PORT=8000
       - RELOAD=false
-    restart: always
+    depends_on:
+      mlflow:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - edf-net
 
+  # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.51.2
+    container_name: edf-prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
     depends_on:
       - api
-    restart: unless-stopped
+    networks:
+      - edf-net
 
+  # ── Grafana ───────────────────────────────────────────────────────────────
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.4.2
+    container_name: edf-grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=mspr2026
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
     depends_on:
       - prometheus
-    restart: unless-stopped
+    networks:
+      - edf-net

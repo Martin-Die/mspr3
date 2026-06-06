@@ -4,13 +4,14 @@ MSPR Bloc 3 | Arthur Méry, Martin Dié, Imed Eddine Zeroual
 
 Endpoints :
   POST /predict   → prédiction de consommation journalière
-  GET  /health    → état de santé du service
+  GET  /health    → état de santé du service (inclut infos MLflow)
   GET  /metrics   → métriques Prometheus (scraping)
-  GET  /models    → liste des modèles disponibles
+  GET  /models    → liste des modèles disponibles + infos MLflow registry
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import logging
@@ -39,10 +40,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODELS_DIR    = Path(os.getenv("MODELS_DIR", "models"))
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "random_forest_latest")
-APP_VERSION   = "1.0.0"
-RATE_LIMIT    = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
+MODELS_DIR           = Path(os.getenv("MODELS_DIR", "models"))
+DEFAULT_MODEL        = os.getenv("DEFAULT_MODEL", "random_forest_latest")
+APP_VERSION          = "1.0.0"
+RATE_LIMIT           = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
+MLFLOW_TRACKING_URI  = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+MLFLOW_EXPERIMENT    = os.getenv("MLFLOW_EXPERIMENT", "edf-consumption")
+REGISTERED_MODEL     = "edf-random-forest"
 
 # --------------------------------------------------------------------------- #
 # Cache modèles                                                                #
@@ -52,6 +56,17 @@ _model_cache: dict = {}
 _request_counts: dict = {}   # IP → (count, window_start)
 
 
+def _load_metrics(model_name: str) -> dict:
+    """Charge le fichier .metrics.json associé au modèle (si disponible)."""
+    path = MODELS_DIR / f"{model_name}.metrics.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {}
+
+
 def get_model(name: str):
     """Charge et met en cache un modèle sérialisé."""
     if name not in _model_cache:
@@ -59,12 +74,25 @@ def get_model(name: str):
         if not path.exists():
             raise FileNotFoundError(f"Modèle {name} introuvable dans {MODELS_DIR}")
         logger.info("[API] Chargement du modèle : %s", name)
+        metrics = _load_metrics(name)
         _model_cache[name] = {
-            "pipeline": joblib.load(path),
-            "loaded_at": datetime.now(UTC).isoformat(),
-            "path": str(path),
+            "pipeline":   joblib.load(path),
+            "loaded_at":  datetime.now(UTC).isoformat(),
+            "path":       str(path),
+            "metrics":    metrics,
+            # Infos MLflow issues du fichier metrics.json
+            "mlflow_run_id":       metrics.get("mlflow_run_id"),
+            "mlflow_tracking_uri": metrics.get("mlflow_tracking_uri", MLFLOW_TRACKING_URI),
+            "registry_version":    metrics.get("registry_version"),
+            "registry_stage":      metrics.get("registry_stage"),
         }
-        logger.info("[API] Modèle %s chargé et mis en cache", name)
+        logger.info(
+            "[API] Modèle %s chargé (MLflow run=%s, version=%s, stage=%s)",
+            name,
+            _model_cache[name]["mlflow_run_id"],
+            _model_cache[name]["registry_version"],
+            _model_cache[name]["registry_stage"],
+        )
     return _model_cache[name]["pipeline"]
 
 
@@ -77,6 +105,7 @@ async def lifespan(app: FastAPI):
     logger.info("[API] Application démarrée (version %s)", APP_VERSION)
     logger.info("[API] Modèle par défaut : %s", DEFAULT_MODEL)
     logger.info("[API] Répertoire des modèles : %s", MODELS_DIR.resolve())
+    logger.info("[API] MLflow tracking URI : %s", MLFLOW_TRACKING_URI)
     yield
     logger.info("[API] Arrêt de l'application")
 
@@ -101,7 +130,7 @@ app.add_middleware(
 )
 
 # --------------------------------------------------------------------------- #
-# Compteurs Prometheus (simples, sans dépendance externe)                      #
+# Compteurs Prometheus                                                         #
 # --------------------------------------------------------------------------- #
 
 class _Counters:
@@ -143,6 +172,10 @@ class PredictResponse(BaseModel):
     prevision_rte_j1_mw: Optional[float] = None
     latency_ms:          float
     timestamp:           str
+    # Nouvelles infos MLflow
+    mlflow_run_id:       Optional[str] = None
+    mlflow_registry_version: Optional[str] = None
+    mlflow_registry_stage:   Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -152,6 +185,16 @@ class HealthResponse(BaseModel):
     model_name:    str
     loaded_at:     Optional[str] = None
     uptime_s:      float
+    # Métriques du modèle
+    r2_score:      Optional[float] = None
+    mape_percent:  Optional[float] = None
+    mae_mw:        Optional[float] = None
+    # Infos MLflow
+    mlflow_tracking_uri:     str
+    mlflow_experiment:       str
+    mlflow_run_id:           Optional[str] = None
+    mlflow_registry_version: Optional[str] = None
+    mlflow_registry_stage:   Optional[str] = None
 
 
 _start_time = time.time()
@@ -173,8 +216,7 @@ async def rate_limit_middleware(request: Request, call_next):
         if count >= RATE_LIMIT:
             logger.warning(
                 "[API] Limite de débit atteinte pour %s (%d requêtes/min)",
-                ip,
-                RATE_LIMIT,
+                ip, RATE_LIMIT,
             )
             from fastapi.responses import JSONResponse
             return JSONResponse(
@@ -198,7 +240,6 @@ def _saison(month: int) -> int:
 
 
 def _num(value: Optional[float], default: float) -> float:
-    """None -> défaut ; 0 est une valeur valide."""
     return default if value is None else float(value)
 
 
@@ -206,9 +247,9 @@ def _build_feature_vector(req: PredictRequest) -> np.ndarray:
     """Construit le vecteur de features (même ordre que l'entraînement)."""
     d = req.date
     is_holiday = int(d.strftime("%Y-%m-%d") in JOURS_FERIES_FR)
-    is_weekend = int(d.weekday() >= 5)
+    is_weekend  = int(d.weekday() >= 5)
+    prevision   = _num(req.prevision_j1, 50_000)
 
-    prevision = _num(req.prevision_j1, 50_000)
     vals = {
         "prevision_j1":      prevision,
         "day_of_week":       d.weekday(),
@@ -235,15 +276,16 @@ def _build_feature_vector(req: PredictRequest) -> np.ndarray:
 
 @app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
 def health():
-    """Vérification de l'état du service (healthcheck)."""
+    """Vérification de l'état du service — inclut les infos MLflow du modèle."""
     logger.info("[API] Requête GET /health")
     try:
         get_model(DEFAULT_MODEL)
-        loaded = True
-        loaded_at = _model_cache[DEFAULT_MODEL]["loaded_at"]
+        loaded   = True
+        cache    = _model_cache[DEFAULT_MODEL]
+        loaded_at = cache["loaded_at"]
+        metrics  = cache["metrics"]
     except Exception as exc:
-        loaded = False
-        loaded_at = None
+        loaded, loaded_at, cache, metrics = False, None, {}, {}
         logger.warning("[API] Santé dégradée : %s", exc)
 
     return HealthResponse(
@@ -253,6 +295,14 @@ def health():
         model_name=DEFAULT_MODEL,
         loaded_at=loaded_at,
         uptime_s=round(time.time() - _start_time, 1),
+        r2_score=metrics.get("r2_score"),
+        mape_percent=metrics.get("mape_percent"),
+        mae_mw=metrics.get("mae_mw"),
+        mlflow_tracking_uri=MLFLOW_TRACKING_URI,
+        mlflow_experiment=MLFLOW_EXPERIMENT,
+        mlflow_run_id=cache.get("mlflow_run_id") if cache else None,
+        mlflow_registry_version=cache.get("registry_version") if cache else None,
+        mlflow_registry_stage=cache.get("registry_stage") if cache else None,
     )
 
 
@@ -269,9 +319,11 @@ def predict(req: PredictRequest):
         _cnt.predict_errors += 1
         raise HTTPException(status_code=404, detail=str(exc))
 
-    X = _build_feature_vector(req)
+    X          = _build_feature_vector(req)
     prediction = float(pipeline.predict(X)[0])
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    cache      = _model_cache.get(req.model_name, {})
+    metrics    = cache.get("metrics", {})
 
     _cnt.predict_ok += 1
     _cnt.latencies.append(latency_ms)
@@ -283,20 +335,41 @@ def predict(req: PredictRequest):
         prediction_mw=round(prediction, 1),
         model_name=req.model_name,
         model_version=APP_VERSION,
+        r2_score=metrics.get("r2_score"),
+        mape_percent=metrics.get("mape_percent"),
         prevision_rte_j1_mw=req.prevision_j1,
         latency_ms=latency_ms,
         timestamp=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        mlflow_run_id=cache.get("mlflow_run_id"),
+        mlflow_registry_version=cache.get("registry_version"),
+        mlflow_registry_stage=cache.get("registry_stage"),
     )
 
 
 @app.get("/models", tags=["Monitoring"])
 def list_models():
-    """Liste les modèles disponibles dans MODELS_DIR."""
+    """Liste les modèles disponibles + infos MLflow registry."""
     paths = list(MODELS_DIR.glob("*.joblib"))
+    models_info = []
+    for p in paths:
+        m = _load_metrics(p.stem)
+        models_info.append({
+            "name":             p.stem,
+            "path":             str(p),
+            "mlflow_run_id":    m.get("mlflow_run_id"),
+            "registry_version": m.get("registry_version"),
+            "registry_stage":   m.get("registry_stage"),
+            "r2_score":         m.get("r2_score"),
+            "mape_percent":     m.get("mape_percent"),
+            "validated_at":     m.get("validated_at"),
+        })
     return {
-        "available_models": [p.stem for p in paths],
-        "loaded_in_cache": list(_model_cache.keys()),
-        "default_model": DEFAULT_MODEL,
+        "available_models":    models_info,
+        "loaded_in_cache":     list(_model_cache.keys()),
+        "default_model":       DEFAULT_MODEL,
+        "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
+        "mlflow_experiment":   MLFLOW_EXPERIMENT,
+        "registered_model":    REGISTERED_MODEL,
     }
 
 
@@ -307,6 +380,12 @@ def metrics_prometheus():
     p50 = float(np.percentile(latencies, 50))
     p95 = float(np.percentile(latencies, 95))
     p99 = float(np.percentile(latencies, 99))
+
+    # Métriques MLflow du modèle par défaut
+    model_metrics = _model_cache.get(DEFAULT_MODEL, {}).get("metrics", {})
+    r2   = model_metrics.get("r2_score",    "NaN")
+    mape = model_metrics.get("mape_percent", "NaN")
+    mae  = model_metrics.get("mae_mw",       "NaN")
 
     lines = [
         "# HELP edf_requests_total Total des requêtes reçues",
@@ -332,6 +411,18 @@ def metrics_prometheus():
         "# HELP edf_uptime_seconds Temps de fonctionnement du service",
         "# TYPE edf_uptime_seconds gauge",
         f"edf_uptime_seconds {time.time() - _start_time:.1f}",
+        "",
+        "# HELP edf_model_r2 R² score du modèle en production",
+        "# TYPE edf_model_r2 gauge",
+        f"edf_model_r2 {r2}",
+        "",
+        "# HELP edf_model_mape_percent MAPE (%) du modèle en production",
+        "# TYPE edf_model_mape_percent gauge",
+        f"edf_model_mape_percent {mape}",
+        "",
+        "# HELP edf_model_mae_mw MAE (MW) du modèle en production",
+        "# TYPE edf_model_mae_mw gauge",
+        f"edf_model_mae_mw {mae}",
     ]
     return "\n".join(lines)
 
